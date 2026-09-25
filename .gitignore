@@ -1,0 +1,29 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Build / packaging output
+build/
+dist/
+*.egg-info/
+
+# Secrets and local environment (never commit)
+.env
+.env.*
+*.key
+*.pem
+secrets.*
