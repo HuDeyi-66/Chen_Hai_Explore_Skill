@@ -1,0 +1,27 @@
+{
+  "schema_version": "0.1",
+  "task_id": "M03_R2",
+  "topic": "missing_authority",
+  "workspace_root": "REPLACED_AT_TEST_TIME",
+  "inputs": [
+    {
+      "source_path": "source/dossier",
+      "destination": "input/dossier",
+      "mode": "copy"
+    }
+  ],
+  "expected_artifacts": [
+    {
+      "artifact_role": "final_answer",
+      "topic": "legal_analysis",
+      "extension": ".md",
+      "required": true
+    },
+    {
+      "artifact_role": "citation_record",
+      "topic": "legal_analysis",
+      "extension": ".json",
+      "required": true
+    }
+  ]
+}

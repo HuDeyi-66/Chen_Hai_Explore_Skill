@@ -7,12 +7,13 @@
 
 ## Status
 
-Reserved / Planned
+Reserved / Planned; the Evidence Discipline Harness MVP is implemented.
 
-This repository is the canonical future implementation home of the Skill. The
-repository is intentionally code-light at this stage. Its initial commits preserve
-the Skill contract, architectural boundary, and planned public interface before
-implementation begins.
+This repository is the canonical future implementation home of the Skill. Its
+initial commits preserve the Skill contract, architectural boundary, and planned
+public interface. The first runtime slice — the evidence discipline harness — is
+implemented under `skills/chenhai_harness/` and documented below. The evidence
+sufficiency role remains designed but not implemented.
 
 ## Purpose
 
@@ -156,9 +157,11 @@ Recovery requested if needed
 
 ## Planned Interface
 
-The planned interface is described only in concepts. No Python API, function
-signature, data schema, package name or CLI command has been designed yet, and
-none is invented here.
+The planned interface for the sufficiency role is described only in concepts. No
+Python API, function signature or data schema for coverage, insufficiency, gaps or
+recovery is designed yet, and none is invented here. The harness MVP does have a
+concrete interface; it is documented in the "Evidence Discipline Harness MVP"
+section below, and it covers only evidence-workspace discipline.
 
 Conceptually the Skill is expected to expose:
 
@@ -183,12 +186,109 @@ extension:
 - a **completeness gate** — whether the expected artifacts and evidence are present;
 - an **integrity check** — whether the evidence state is intact and traceable.
 
-These are named concepts only. No concrete Python class, function signature, data
-schema, package name or CLI command is designed here, and none is invented. The
-interfaces are not claimed to exist. The naming convention and the workspace
-specification are both expected to evolve.
+These are named concepts only, with one exception: the semantic naming policy, the
+controlled workspace specification, the expected artifact declaration, the
+completeness gate and the integrity check now have a concrete MVP implementation,
+described in the "Evidence Discipline Harness MVP" section immediately below.
+Everything else here remains conceptual and no interface for it is invented. The
+naming convention and the workspace specification are both expected to evolve.
 
-Naming, encoding, error behaviour and integration surface remain to be designed.
+For the sufficiency role, naming, encoding, error behaviour and integration
+surface remain to be designed.
+
+## Evidence Discipline Harness MVP
+
+The harness MVP is implemented in this repository under
+[`skills/chenhai_harness/`](./skills/chenhai_harness/). It is a small
+deterministic filesystem harness whose purpose is to reduce manual experiment and
+evidence workspace handling. It contains no LLM dependency, performs no retrieval,
+performs no semantic inference, and makes no judgement about whether an artifact's
+content is substantively correct.
+
+### Why it exists
+
+Producing evidence under controlled conditions is not only a matter of producing
+the right bytes. Which inputs were permitted, what was expected, what was actually
+produced, and whether any of it has changed since are questions that otherwise
+depend on human discipline and on someone's memory of what they did. The harness
+makes those questions mechanical.
+
+### The four operations
+
+| Operation | Purpose |
+| --- | --- |
+| `init` | Validate a TaskSpec and create the controlled workspace: `input/`, `output/`, `manifests/`, `checks/`. Refuses to overwrite incompatible content. |
+| `stage` | Copy declared inputs (`mode: "copy"`, files or directories recursively) into `input/` and record every file's size and SHA-256 in `manifests/input_manifest.json`. |
+| `place` | Copy an already-produced artifact into `output/` under its canonical filename and update `manifests/output_manifest.json`. Refuses a collision unless the bytes are identical. |
+| `validate` | Check TaskSpec integrity, layout, required artifacts, naming compliance, expected location, manifest hashes, unexpected output files, and path boundaries. Writes `checks/validation_report.json`. |
+
+CLI:
+
+```
+python -m skills.chenhai_harness init <task_spec.json>
+python -m skills.chenhai_harness stage <workspace>
+python -m skills.chenhai_harness place <workspace> <source_file> --role final_answer --topic legal_analysis
+python -m skills.chenhai_harness validate <workspace>
+```
+
+Exit codes: `0` PASS or successful operation, `2` INCOMPLETE, `3` REFUSE,
+`1` unexpected internal error.
+
+### TaskSpec
+
+JSON only, schema version `0.1`, with the required top-level fields
+`schema_version`, `task_id`, `topic`, `workspace_root`, `inputs` and
+`expected_artifacts`. Absolute host paths are required for `workspace_root`;
+`inputs[].destination` must stay inside `input/`; the only supported `mode` is
+`copy`. Unknown fields are refused rather than ignored.
+
+### Naming convention
+
+```
+<normalized_task_id>__<normalized_topic>__<normalized_artifact_role><extension>
+```
+
+Example: `m03_r2__legal_analysis__final_answer.md`.
+
+Normalisation is deterministic: NFKC, surrounding whitespace trimmed, ASCII
+lowercased, runs of characters that are not ASCII `[a-z0-9]` or Unicode
+alphanumerics collapsed to a single underscore, path separators and standalone
+`..` rejected, and empty results rejected. The name comes from the TaskSpec or
+from an explicit command argument only — never from file content.
+
+### PASS / INCOMPLETE / REFUSE
+
+- **PASS** — every required artifact is present under its canonical name and every
+  recorded digest still matches.
+- **INCOMPLETE** — the workspace is sound but required artifacts are absent. Not
+  finished is not the same as not trustworthy.
+- **REFUSE** — invalid spec, unsafe path, naming violation, manifest corruption,
+  hash mismatch, collision, or an unexpected file in `output/`. `REFUSE` outranks
+  `INCOMPLETE`.
+
+### Explicit limitation: this is not an OS sandbox
+
+The MVP is **not** an operating-system sandbox. It does not prevent an external
+model, process, or user from reading or writing arbitrary paths, and it does not
+contain, jail, or otherwise isolate anything. It only constructs a controlled
+workspace, constrains the paths its own operations will construct and write,
+stages known inputs, records manifests, and validates the resulting workspace. No
+filesystem isolation is implemented and none is claimed.
+
+The four core directories are the whole hierarchy. The harness is not a general
+file manager, does not rename unrelated files, does not retrieve evidence, does
+not mutate canonical evidence, and makes no claim about evidence sufficiency.
+
+### Tests and demo
+
+```
+python tests/run_all.py     # unittest discovery
+pytest tests                # the same suite
+python tests/smoke_e2e.py   # synthetic end-to-end demonstration
+```
+
+`fixtures/m03_r2_demo/` is entirely synthetic: no real calibration evidence and
+no private path is present.
 
 ## Development Roadmap
 
@@ -206,3 +306,12 @@ Naming, encoding, error behaviour and integration surface remain to be designed.
 6. Publish an implementation only when the contract is honoured end to end.
 
 Each stage is a prerequisite for the next. No stage is claimed as complete.
+
+Status of the stages: 1 and 2 are recorded in this repository as the canonical
+contract. Stage 3 is recorded conceptually; of the concepts it names, the
+semantic naming policy, the controlled workspace specification, the expected
+artifact declaration, the completeness gate and the integrity check now have a
+concrete MVP implementation in `skills/chenhai_harness/`, while the coverage,
+insufficiency, gap and recovery notions remain conceptual only. Stages 4 to 6 are
+not started. The evidence sufficiency role is unchanged and unimplemented; the
+harness MVP is an extension of the Skill, not a substitute for its primary role.

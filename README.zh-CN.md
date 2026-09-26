@@ -8,11 +8,12 @@
 >
 > 它也负责让证据在边界明确、命名清楚、可审计的环境中被处理。
 
-**开发状态：Reserved / Planned（已预留 / 规划中）**
+**开发状态：Reserved / Planned（已预留 / 规划中）；证据约束 Harness MVP 已实现**
 
 本仓库是本 Skill 的正式（canonical）未来实现仓库。
-本仓库在当前阶段刻意保持"文档优先、代码极少"。
 其初始提交用于在实现开始之前，先固定 Skill 契约、架构边界与计划中的公开接口。
+第一个最小运行时切片——证据约束 Harness MVP——已在 `skills/chenhai_harness/`
+下实现，并在下文说明。证据充分性判断职责仍停留在设计阶段，尚未实现。
 
 ## 它是什么
 
@@ -127,7 +128,8 @@ ChenHai 约束产物的命名。它**不会**仅仅为了满足命名规则而�
 其目的是减少：证据污染、对禁入材料的意外访问、来源含混、失控写入、陈旧或无关上下文、
 事后重建，以及评估泄漏。
 
-计划中的概念元素 —— 这里只作为意图记录，**尚未实现**：
+计划中的概念元素 —— 这里作为意图记录。MVP 目前已实现语义化命名策略、受控工作区规范、
+期望产物声明、完整性门槛与完整性校验；其余元素仍只是意图：
 
 - ControlledEvidenceWorkspace（受控证据工作区）
 - 输入边界
@@ -141,7 +143,119 @@ ChenHai 约束产物的命名。它**不会**仅仅为了满足命名规则而�
 - 完整性门槛
 - 失败 / 拒答状态
 
-本阶段没有设计任何运行时类、包、schema 或沙箱 API，也不声称它们已经存在。
+除该 Harness MVP 之外，没有设计任何进一步的运行时类、包、schema 或沙箱 API，
+也不声称它们已经存在。MVP 本身没有实现任何沙箱 API，也不作此声明。
+
+## 证据约束 Harness MVP（Evidence Discipline Harness MVP）
+
+Harness 的第一个最小运行时切片已经实现，位于本仓库的
+[`skills/chenhai_harness/`](./skills/chenhai_harness/)。
+它是一个小型的、确定性的文件系统 Harness：**不依赖任何 LLM**，不做检索，
+不做语义推断，也不判断产物内容在实质上是否正确。
+
+其目的不是提升检索质量，而是减少实验 / 证据工作区的人工处理。
+
+### 为什么需要这个 Harness
+
+在受控条件下产出证据，不只是"写对字节"的问题。哪些输入被允许、期望产出什么、
+实际产出了什么、以及这些内容此后是否被改动过——这些问题原本依赖人的自觉和记忆。
+Harness 把它们变成机械可查的。
+
+### 四个操作
+
+```
+TaskSpec
+    ↓
+init       构建受控工作区
+    ↓
+stage      暂存允许的输入
+    ↓
+place      放置声明的产物
+    ↓
+hash / manifest
+    ↓
+validate   校验期望产出
+    ↓
+PASS / INCOMPLETE / REFUSE
+```
+
+工作区只包含四个目录，不引入更深的层级：
+
+```
+<workspace_root>/
+    input/
+    output/
+    manifests/
+    checks/
+```
+
+| 操作 | 作用 |
+| --- | --- |
+| `init` | 校验 TaskSpec 并创建工作区，把 spec 持久化到 `manifests/task_spec.json`。若目标位置已有不兼容内容则拒绝，而不是删除或重置。 |
+| `stage` | 按声明暂存输入（`mode: "copy"`，支持单文件与目录递归）到 `input/`，并在 `manifests/input_manifest.json` 中逐文件记录 `relative_path`、`size_bytes`、`sha256_lower` 与 `source_path`。原始输入永不被修改。 |
+| `place` | 把已经产出的产物按规范文件名复制到 `output/`，并更新 `manifests/output_manifest.json`。默认复制而非移动，绝不检查产物内容；命名冲突时除非字节完全一致否则拒绝；字节一致时该操作是幂等的。 |
+| `validate` | 校验 TaskSpec 完整性、工作区布局、必需产物、规范文件名、期望位置、清单与文件哈希一致性、受控输出目录中的意外文件，以及路径边界。写入 `checks/validation_report.json`。 |
+
+```
+python -m skills.chenhai_harness init <task_spec.json>
+python -m skills.chenhai_harness stage <workspace>
+python -m skills.chenhai_harness place <workspace> <source_file> --role final_answer --topic legal_analysis
+python -m skills.chenhai_harness validate <workspace>
+```
+
+退出码：`0` 表示 PASS 或操作成功，`2` 表示 INCOMPLETE，`3` 表示 REFUSE，
+`1` 表示意外的内部错误。`2` 与 `3` 刻意区分：调用方必须能够区分
+"还没做完"和"不可信"。
+
+### TaskSpec
+
+仅使用 JSON，schema 版本为 `0.1`，必需顶层字段为 `schema_version`、`task_id`、
+`topic`、`workspace_root`、`inputs`、`expected_artifacts`。出现未知字段会被拒绝，
+而不是被静默忽略。唯一支持的暂存 `mode` 是 `copy`，且 `inputs[].destination`
+必须位于 `input/` 之内。
+
+### 命名约定
+
+```
+<normalized_task_id>__<normalized_topic>__<normalized_artifact_role><extension>
+```
+
+例如：`m03_r2__legal_analysis__final_answer.md`。
+
+规范化过程是确定性的：NFKC、去除首尾空白、ASCII 转小写、把非 `[a-z0-9]` 且
+非 Unicode 字母数字的连续字符折叠为单个下划线、拒绝路径分隔符与独立的 `..`、
+拒绝规范化后为空的结果。文件名只来自 TaskSpec 或显式命令参数，
+**绝不**通过检查文件内容推断。
+
+### PASS / INCOMPLETE / REFUSE
+
+- **PASS** —— 全部必需产物存在、命名合规、哈希一致。
+- **INCOMPLETE** —— 工作区本身有效，但缺少一个或多个必需的期望产物。
+- **REFUSE** —— spec 非法、路径不安全、命名违规、清单损坏、哈希不匹配、命名冲突，
+  或其他完整性违规（包括受控输出目录中出现意外文件）。`REFUSE` 优先于 `INCOMPLETE`。
+
+### 明确限制：这不是操作系统沙箱
+
+**本 MVP 不是操作系统沙箱。** 它不能阻止外部模型、进程或用户读写任意路径。
+它没有实现任何文件系统隔离，也不应被推断出这类能力。
+
+它所做的范围很窄：构建受控工作区、约束**自身**操作会构造与写入的路径、暂存已知输入、
+记录清单、约束并校验受管理的输出、校验最终工作区状态。路径检查约束的是
+*本 Harness 自身*的行为，而不是其他程序能做什么。
+
+相应地，Harness 不是通用文件管理器，不会重命名无关的用户文件，不检索证据，
+不改动正式证据，也不判断产物在实质上是否正确。它只做证据工作区层面的约束。
+
+### 测试与演示
+
+```
+python tests/run_all.py     # unittest 发现
+pytest tests                # 同一套测试
+python tests/smoke_e2e.py   # 合成端到端演示
+```
+
+`fixtures/m03_r2_demo/` 只包含一个小型合成演示，不含任何真实标定证据、
+私有路径或私有实验产物。
 
 ### Harness 的边界
 
@@ -203,20 +317,23 @@ ChenHai 评估覆盖度 / 不充分性
 
 ## 计划中的开发
 
-本仓库的初始提交确立 Skill 契约、边界与计划中的接口。实现尚未开始。
-概念性接口与路线图见 [SKILL.md](./SKILL.md)。
+本仓库的初始提交确立 Skill 契约、边界与计划中的接口。证据约束 Harness MVP 已实现；
+证据充分性判断职责尚未实现。概念性接口与路线图见 [SKILL.md](./SKILL.md)。
 
 本仓库不作任何基准测试、性能或生产可用性声明。精确率 / 召回率评估是计划中的职责，
-而不是已经报告的结果。
+而不是已经报告的结果。Harness MVP 不对证据质量、检索质量或充分性作任何声明。
 
 ## 仓库状态
 
 | 项目 | 内容 |
 | --- | --- |
-| 状态 | Reserved / Planned（已预留 / 规划中） |
-| 实现 | 尚未开始（文档优先） |
+| 状态 | Reserved / Planned（已预留 / 规划中）；Harness MVP 已实现 |
+| 实现 | `skills/chenhai_harness/` 中的证据约束 Harness MVP；充分性职责尚未开始 |
 | 默认分支 | main |
 | 语言 | English, 简体中文, 繁體中文, 日本語 |
+
+证据约束 Harness MVP 在 [README.md](./README.md)（英文）与本文件（简体中文）中说明；
+繁體中文与日本語版本目前只描述 Skill 契约。
 
 ## 许可证
 

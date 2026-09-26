@@ -140,6 +140,21 @@ ChenHai 約束產物的命名。它**不會**僅僅為了滿足命名規則而�
 
 本階段沒有設計任何執行期類別、套件、schema 或沙箱 API，也不聲稱它們已經存在。
 
+### 證據約束 Harness MVP（Evidence Discipline Harness MVP）
+
+Harness 的第一個最小執行期切片已經實作，位於 [`skills/chenhai_harness/`](./skills/chenhai_harness/)：
+一個小型、確定性的檔案系統 Harness，**不依賴任何 LLM**，不做檢索、不做語意推斷，
+也不判斷產物內容在實質上是否正確。它實作了語意化命名策略、受控工作區規範、
+期望產物宣告、完整性門檻與完整性校驗。
+
+四個操作為 `init`、`stage`、`place`、`validate`，結果為 `PASS`、`INCOMPLETE` 或
+`REFUSE`。**本 MVP 不是作業系統沙箱**：它不能阻止外部模型、行程或使用者讀寫任意路徑，
+也沒有實作任何檔案系統隔離。
+
+完整的實作說明（操作、TaskSpec、命名慣例、退出碼與沙箱限制）見英文
+[README.md](./README.md) 與簡體中文 [README.zh-CN.md](./README.zh-CN.md)；
+本文件目前只描述 Skill 契約。
+
 ### Harness 的邊界
 
 該能力約束的是證據處理方式，而不是製造證據。
@@ -200,18 +215,18 @@ ChenHai 評估覆蓋度 / 不充分性
 
 ## 計畫中的開發
 
-本倉庫的初始提交確立 Skill 契約、邊界與計畫中的介面。實作尚未開始。
-概念性介面與路線圖見 [SKILL.md](./SKILL.md)。
+本倉庫的初始提交確立 Skill 契約、邊界與計畫中的介面。證據約束 Harness MVP 已實作；
+證據充分性判斷職責尚未實作。概念性介面與路線圖見 [SKILL.md](./SKILL.md)。
 
 本倉庫不作任何基準測試、效能或生產可用性聲明。精確率 / 召回率評估是計畫中的職責，
-而不是已經報告的結果。
+而不是已經報告的結果。Harness MVP 不對證據品質、檢索品質或充分性作任何聲明。
 
 ## 倉庫狀態
 
 | 項目 | 內容 |
 | --- | --- |
-| 狀態 | Reserved / Planned（已預留 / 規劃中） |
-| 實作 | 尚未開始（文件優先） |
+| 狀態 | Reserved / Planned（已預留 / 規劃中）；Harness MVP 已實作 |
+| 實作 | `skills/chenhai_harness/` 中的證據約束 Harness MVP；充分性職責尚未開始 |
 | 預設分支 | main |
 | 語言 | English, 简体中文, 繁體中文, 日本語 |
 

@@ -21,6 +21,12 @@ build/
 dist/
 *.egg-info/
 
+# Harness scratch directories (tests and the smoke demo create these; a leaked
+# one must never be committed)
+chenhai_scratch_*/
+chenhai_smoke_*/
+chenhai_kept_*/
+
 # Secrets and local environment (never commit)
 .env
 .env.*

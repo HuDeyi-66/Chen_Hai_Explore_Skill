@@ -1,0 +1,5 @@
+Synthetic register entry (demo fixture).
+
+authority_reference: SYNTHETIC-001
+status: demonstration only
+note: no real authority is represented by this record
