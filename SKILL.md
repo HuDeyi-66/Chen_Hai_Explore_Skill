@@ -44,6 +44,12 @@ Evidence discipline extension:
   purpose-specific environment for a formal evidence task before that task runs;
 - evidence-environment validation ahead of a formal evidence task.
 
+Of the evidence-discipline extension, all three items now have a concrete MVP
+implementation: `init` and `validate` cover workspace construction and
+environment validation, and the naming policy is enforced by `place` and checked
+by `validate`. See the "Evidence Discipline Harness MVP" section below. None of
+the sufficiency responsibilities above is implemented.
+
 ## Non-Responsibilities
 
 - retrieving evidence itself;
@@ -74,7 +80,10 @@ Conceptually, ChenHai consumes:
 - optional ground-truth material such as qrels, where it exists;
 - requests for coverage assessment or gap inspection.
 
-Input formats, schemas or transport mechanisms are not yet designed.
+Input formats, schemas or transport mechanisms for the sufficiency role are not
+yet designed. The harness MVP does define one concrete input contract — the
+TaskSpec, JSON schema version `0.1` — and that is documented in the "Evidence
+Discipline Harness MVP" section below.
 
 ## Outputs
 
@@ -87,7 +96,10 @@ Conceptually, ChenHai produces:
 - retry and recovery recommendations addressed to orchestration callers;
 - evaluation results when ground-truth material is available.
 
-Output formats, schemas or storage mechanisms are not yet designed.
+Output formats, schemas or storage mechanisms for the sufficiency role are not yet
+designed. The harness MVP produces three concrete machine-readable documents,
+also documented in the section below: `manifests/input_manifest.json`,
+`manifests/output_manifest.json` and `checks/validation_report.json`.
 
 ## Evidence Boundary
 
