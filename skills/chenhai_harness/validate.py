@@ -79,11 +79,18 @@ class ValidationFindings:
 
 @dataclass(frozen=True)
 class ValidationResult:
-    """The outcome of ``validate``, plus where the report was written."""
+    """The outcome of ``validate``, plus where the report was written.
+
+    ``report_written`` is False when the refusal report deliberately was not
+    persisted, which happens when ``checks/`` failed resolved-path boundary
+    validation. The status and findings are still fully available in memory and
+    through the CLI, so a caller never loses the refusal.
+    """
 
     status: str
     report: dict[str, Any]
     report_path: str
+    report_written: bool = True
 
     def to_json(self) -> dict[str, Any]:
         return self.report
@@ -101,18 +108,24 @@ def _check_layout(workspace: WorkspaceLayout, findings: ValidationFindings) -> N
 
 def _check_path_boundaries(
     workspace: WorkspaceLayout, findings: ValidationFindings
-) -> None:
+) -> dict[str, bool]:
     """Check H: the workspace and its managed directories stay where they claim.
 
     ``workspace.root`` is already resolved, so no re-normalisation of the root
     itself is needed and none is done: that would compare a resolved path with
     a resolved path and prove nothing. What *is* checked is the one boundary
     violation observable purely from workspace state — a core directory that
-    resolves inside the workspace but is physically located somewhere else,
-    which is exactly the case where a later ``place`` would write outside the
-    declared room.
+    resolves away from its declared location inside the workspace (a junction or
+    reparse point), which is exactly the case where a later write would land
+    outside the declared room.
+
+    Returns a per-directory verdict so callers can refuse to write through a
+    directory that failed its boundary check. A verdict is absent for a
+    directory that does not exist, or that could not be resolved; both are
+    treated as "do not write through it".
     """
     root = workspace.root
+    safe: dict[str, bool] = {}
     for name, path in workspace.core_dirs().items():
         if not path.exists():
             continue
@@ -120,12 +133,18 @@ def _check_path_boundaries(
             resolved = path.resolve(strict=False)
         except OSError as error:  # pragma: no cover - defensive
             findings.integrity_errors.append(f"{name}/ is unresolvable: {error}")
+            safe[name] = False
             continue
-        if resolved != path or (resolved != root and root not in resolved.parents):
+        inside = resolved == root or root in resolved.parents
+        if resolved != path or not inside:
             findings.integrity_errors.append(
                 f"path boundary: {name}/ resolves away from its declared "
                 f"location inside the workspace ({path} -> {resolved})"
             )
+            safe[name] = False
+        else:
+            safe[name] = True
+    return safe
 
 
 def _check_task_spec(
@@ -247,6 +266,48 @@ def _produced_output_files(workspace: WorkspaceLayout) -> list[str]:
     )
 
 
+def _check_manifest_coverage(
+    *,
+    label: str,
+    managed_files: list[str],
+    recorded: dict[str, int],
+    findings: ValidationFindings,
+) -> None:
+    """Check F (continued): the manifest and the filesystem describe the same set.
+
+    Hash checking alone proves that entries which *exist* are still accurate. It
+    does not prove the manifest accounts for everything actually present, so an
+    unlisted file could sit inside a managed directory while validation still
+    reported ``PASS``. This closes that gap by requiring set equality in both
+    directions:
+
+    * every managed file has exactly one manifest entry;
+    * every manifest entry has exactly one existing managed file;
+    * no relative path appears in the manifest more than once.
+
+    ``managed_files`` comes from the filesystem, ``recorded`` from the manifest,
+    and both are compared as path sets over the same relative-path convention, so
+    the two directions cannot drift apart.
+    """
+    actual = set(managed_files)
+    declared = set(recorded)
+
+    for relative in sorted(declared - actual):
+        findings.hash_mismatches.append(
+            f"{relative} (recorded in the {label} manifest but missing on disk)"
+        )
+    for relative in sorted(actual - declared):
+        findings.hash_mismatches.append(
+            f"{relative} (present under {label}/ but not recorded in the "
+            f"{label} manifest)"
+        )
+    for relative in sorted(path for path, count in recorded.items() if count > 1):
+        findings.hash_mismatches.append(
+            f"{relative} (recorded {recorded[relative]} times in the "
+            f"{label} manifest; exactly one entry per managed file is required)"
+        )
+
+
 def _check_manifest(
     *,
     manifest_path: Path,
@@ -254,21 +315,21 @@ def _check_manifest(
     label: str,
     findings: ValidationFindings,
     base_dir: Path,
-    absent_is_error: bool = True,
+    managed_files: list[str],
 ) -> None:
-    """Check F: every entry in a manifest still matches the file it describes.
+    """Check F: every entry in a manifest matches the file it describes.
 
-    ``absent_is_error=False`` is used for the input manifest, which is genuinely
-    optional while nothing has been staged: a freshly initialised workspace has
-    no staged input and therefore nothing to record. Once content exists under
-    ``input/``, that content must be accounted for, so the absent manifest
-    becomes an integrity error. ``validate`` decides which case applies and
-    passes the answer in, rather than this function guessing.
+    ``managed_files`` is the authoritative filesystem side of the comparison and
+    also decides whether the manifest must exist at all: a freshly initialised
+    workspace has nothing staged or placed, so there is nothing to record, and an
+    absent manifest is not a finding. As soon as managed content exists it must be
+    accounted for, and the absent manifest becomes an integrity error.
     """
     if not manifest_path.is_file():
-        if absent_is_error:
+        if managed_files:
             findings.integrity_errors.append(
-                f"{label} manifest is missing: {manifest_path.name}"
+                f"{label} manifest is missing while managed files exist: "
+                f"{manifest_path.name}"
             )
         return
     try:
@@ -293,6 +354,9 @@ def _check_manifest(
         )
         return
 
+    #: relative path -> how many entries declare it, so duplicates are visible.
+    recorded: dict[str, int] = {}
+
     for position, entry in enumerate(entries):
         if not isinstance(entry, dict):
             findings.integrity_errors.append(
@@ -300,13 +364,14 @@ def _check_manifest(
             )
             continue
         relative = entry.get("relative_path")
-        recorded = entry.get("sha256_lower")
+        recorded_digest = entry.get("sha256_lower")
         if not isinstance(relative, str) or not relative:
             findings.integrity_errors.append(
                 f"{label} manifest entry #{position} has no relative_path"
             )
             continue
-        if not isinstance(recorded, str) or len(recorded) != 64:
+        recorded[relative] = recorded.get(relative, 0) + 1
+        if not isinstance(recorded_digest, str) or len(recorded_digest) != 64:
             findings.integrity_errors.append(
                 f"{label} manifest entry {relative!r} has no usable sha256_lower"
             )
@@ -323,20 +388,26 @@ def _check_manifest(
             continue
 
         if not target.is_file():
-            findings.hash_mismatches.append(
-                f"{relative} (recorded in {manifest_path.name} but missing on disk)"
-            )
+            # Reported by the coverage comparison below, which owns the
+            # manifest-versus-filesystem path-set verdict.
             continue
         actual = sha256_file(target)
-        if actual != recorded:
+        if actual != recorded_digest:
             findings.hash_mismatches.append(
-                f"{relative} (sha256 {actual} != recorded {recorded})"
+                f"{relative} (sha256 {actual} != recorded {recorded_digest})"
             )
         recorded_size = entry.get("size_bytes")
         if isinstance(recorded_size, int) and recorded_size != target.stat().st_size:
             findings.hash_mismatches.append(
                 f"{relative} (size {target.stat().st_size} != recorded {recorded_size})"
             )
+
+    _check_manifest_coverage(
+        label=label,
+        managed_files=managed_files,
+        recorded=recorded,
+        findings=findings,
+    )
 
 
 def _declared_identity(
@@ -403,12 +474,14 @@ def validate_workspace(
     task_id = ""
 
     _check_layout(workspace, findings)
-    _check_path_boundaries(workspace, findings)
+    boundary_safe = _check_path_boundaries(workspace, findings)
 
     loaded = _check_task_spec(workspace, findings)
     if loaded is not None:
         spec, _ = loaded
         task_id = spec.task_id
+        staged_inputs = _staged_input_files(workspace)
+        produced_outputs = _produced_output_files(workspace)
         _check_output_names(workspace, spec, findings)
         _check_required_artifacts(workspace, spec, findings)
         _check_spec_identity_consistency(workspace, spec, findings)
@@ -417,22 +490,19 @@ def validate_workspace(
             collection_key="entries",
             label="input",
             findings=findings,
+            # Manifest paths are workspace-relative for both manifests, so the
+            # base is the workspace root in both cases. Using input/ here would
+            # look for input/input/<name> and report a spurious mismatch.
             base_dir=workspace.root,
-            # Optional until something is actually staged, then mandatory.
-            absent_is_error=bool(_staged_input_files(workspace)),
+            managed_files=staged_inputs,
         )
         _check_manifest(
             manifest_path=workspace.output_manifest_path,
             collection_key="artifacts",
             label="output",
             findings=findings,
-            # Manifest paths are workspace-relative for both manifests, so the
-            # base is the workspace root in both cases. Using output/ here would
-            # look for output/output/<name> and report a spurious mismatch.
             base_dir=workspace.root,
-            # Optional until something has actually been placed, then mandatory:
-            # a file in output/ that no manifest accounts for is unreferenced.
-            absent_is_error=bool(_produced_output_files(workspace)),
+            managed_files=produced_outputs,
         )
     else:
         # With no trustworthy TaskSpec there is nothing to compare against, but
@@ -460,13 +530,24 @@ def validate_workspace(
     )
 
     report_path = workspace.validation_report_path
-    if write_report and workspace.checks_dir.is_dir():
+    # Never write through a checks directory that failed resolved-path boundary
+    # validation: a junction or reparse point there would place the report
+    # outside the managed workspace. Writing nowhere is the correct outcome, and
+    # there is deliberately no fallback to any directory outside the workspace —
+    # not the parent, not the repository root, not system temp. The refusal is
+    # still returned to the caller, which is enough for the MVP.
+    report_written = False
+    if write_report and boundary_safe.get("checks", False) and workspace.checks_dir.is_dir():
         from .jsonio import atomic_write_json
 
         atomic_write_json(report_path, report)
+        report_written = True
 
     return ValidationResult(
-        status=status, report=report, report_path=str(report_path)
+        status=status,
+        report=report,
+        report_path=str(report_path),
+        report_written=report_written,
     )
 
 

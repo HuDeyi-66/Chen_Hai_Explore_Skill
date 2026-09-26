@@ -37,7 +37,12 @@ from typing import Any
 from .hashing import files_are_identical, sha256_file
 from .init import load_persisted_task_spec
 from .jsonio import atomic_write_json, read_json
-from .naming import canonical_filename, extract_extension, normalize_component, normalize_extension
+from .naming import (
+    canonical_filename,
+    extract_extension,
+    normalize_component,
+    normalize_extension,
+)
 from .outcomes import RefusalError
 from .paths import UnsafePathError, as_posix_relative, resolve_under
 from .workspace import WorkspaceLayout, layout_for, make_output_manifest
@@ -135,6 +140,45 @@ def _read_output_manifest(workspace: WorkspaceLayout) -> list[dict[str, Any]]:
     return artifacts
 
 
+def _matching_declaration(
+    spec: Any, *, artifact_role: str, topic: str, extension: str
+) -> Any | None:
+    """Return the TaskSpec declaration this artifact matches, or ``None``.
+
+    Identity is the MVP-declared triple — ``artifact_role``, ``topic`` and
+    ``extension`` — compared through the *same* normalisation that builds the
+    canonical filename, so a declaration cannot appear to match through one code
+    path and fail to match through the other.
+
+    Only the declaration supplies these three values, and each expected artifact
+    is already validated and unique by canonical filename at TaskSpec parse time,
+    so at most one declaration can match and no disambiguation is needed.
+    """
+    for expected in spec.expected_artifacts:
+        if (
+            normalize_component(expected.artifact_role, field="artifact_role")
+            == artifact_role
+            and normalize_component(expected.topic, field="topic") == topic
+            and normalize_extension(expected.extension) == extension
+        ):
+            return expected
+    return None
+
+
+def _declared_identities(spec: Any) -> str:
+    """Render the declared artifact identities for a refusal message."""
+    if not spec.expected_artifacts:
+        return "  (TaskSpec declares no expected_artifacts)"
+    lines = []
+    for expected in spec.expected_artifacts:
+        lines.append(
+            f"  - artifact_role={expected.artifact_role!r} "
+            f"topic={expected.topic!r} extension={expected.extension!r} "
+            f"required={expected.required}"
+        )
+    return "\n".join(lines)
+
+
 def place_artifact(
     workspace_root: Path | str,
     source_path: Path | str,
@@ -143,7 +187,13 @@ def place_artifact(
     topic: str,
     extension: str | None = None,
 ) -> PlaceResult:
-    """Copy one artifact into ``output/`` under its canonical filename."""
+    """Copy one artifact into ``output/`` under its canonical filename.
+
+    The declaration gate runs before the destination is computed and before any
+    byte is copied. An artifact the TaskSpec does not declare is refused, so
+    ``place`` can never create a file that ``validate`` would then reject as
+    undeclared: the two operations agree on what the workspace may contain.
+    """
     spec, _ = load_persisted_task_spec(workspace_root)
     workspace = layout_for(spec.workspace_root)
 
@@ -157,6 +207,22 @@ def place_artifact(
     resolved_extension = _resolve_extension(
         explicit=extension, source=source, artifact_role=artifact_role
     )
+
+    declaration = _matching_declaration(
+        spec,
+        artifact_role=normalized_role,
+        topic=normalized_topic,
+        extension=resolved_extension,
+    )
+    if declaration is None:
+        raise RefusalError(
+            "refusing to place an artifact that TaskSpec does not declare: "
+            f"artifact_role={normalized_role!r} topic={normalized_topic!r} "
+            f"extension={resolved_extension!r}. The controlled output area "
+            "accepts declared artifacts only; nothing was written and the "
+            "output manifest is unchanged. Declared artifacts for this task:\n"
+            + _declared_identities(spec)
+        )
 
     filename = canonical_filename(
         task_id=spec.task_id,
@@ -209,12 +275,9 @@ def place_artifact(
             "size_bytes": size_bytes,
             "sha256_lower": digest,
             "extension": resolved_extension,
-            "required": any(
-                expected.artifact_role == normalized_role
-                and expected.topic == normalized_topic
-                and expected.extension == resolved_extension
-                for expected in spec.expected_artifacts
-            ),
+            # Taken from the matched declaration rather than re-derived, so the
+            # recorded flag cannot disagree with the gate that admitted it.
+            "required": declaration.required,
         }
     )
     document = make_output_manifest(task_id=spec.task_id, artifacts=artifacts)

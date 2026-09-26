@@ -221,8 +221,8 @@ The workspace contains only four directories, and no deeper hierarchy:
 | --- | --- |
 | `init` | Validate the TaskSpec and create the workspace. Persists the spec at `manifests/task_spec.json`. Refuses incompatible existing content instead of deleting or resetting it. |
 | `stage` | Copy declared inputs (`mode: "copy"`; single files or directories recursively) into `input/` and record `relative_path`, `size_bytes`, `sha256_lower` and `source_path` for every staged file in `manifests/input_manifest.json`. Original inputs are never modified. |
-| `place` | Copy an already-produced artifact into `output/` under its canonical filename and update `manifests/output_manifest.json`. Copies rather than moves, never inspects the artifact's content, refuses a collision unless the bytes are identical, and is idempotent when they are. |
-| `validate` | Check TaskSpec integrity, workspace layout, required artifacts, canonical filename compliance, expected location, manifest/file hash consistency, unexpected files in the controlled output directory, and path-boundary violations. Writes `checks/validation_report.json`. |
+| `place` | Copy an already-produced artifact into `output/` under its canonical filename and update `manifests/output_manifest.json`. **Accepts declared artifacts only**: the request must match a TaskSpec `expected_artifacts` entry on `artifact_role`, `topic` and `extension`, matched through the same normalisation that builds the canonical filename. An undeclared artifact is refused before any byte is copied, so no output file, no manifest change and no partial write occurs. Copies rather than moves, never inspects the artifact's content, refuses a collision unless the bytes are identical, and is idempotent when they are. |
+| `validate` | Check TaskSpec integrity, workspace layout, required artifacts, canonical filename compliance, expected location, manifest/file hash consistency, manifest coverage of managed input/output files, unexpected files in the controlled output directory, and path-boundary violations. Writes `checks/validation_report.json` — but never through a `checks/` directory that resolves outside the managed workspace. |
 
 ```
 python -m skills.chenhai_harness init <task_spec.json>
@@ -259,14 +259,43 @@ explicit command argument only — **never** from inspecting file content.
 
 ### PASS / INCOMPLETE / REFUSE
 
-- **PASS** — all required artifacts present, canonically named, and
-  hash-consistent.
+- **PASS** — all required artifacts present, canonically named, hash-consistent,
+  **and fully accounted for by the manifests**: every managed file under `input/`
+  and `output/` has exactly one manifest entry, every manifest entry corresponds
+  to exactly one existing managed file, and no relative path is recorded twice. A
+  managed file the manifest does not account for is a refusal, not a warning.
 - **INCOMPLETE** — the workspace is valid but one or more required expected
   artifacts are missing.
 - **REFUSE** — invalid spec, unsafe path, naming violation, manifest corruption,
-  hash mismatch, collision, or another integrity violation, including an
-  unexpected file inside the controlled output directory. `REFUSE` takes
-  precedence over `INCOMPLETE`.
+  hash mismatch, manifest coverage failure, undeclared placement, collision, or
+  another integrity violation, including an unexpected file inside the controlled
+  output directory and any path-boundary violation. `REFUSE` takes precedence over
+  `INCOMPLETE`.
+
+### Manifest coverage
+
+`validate` compares the manifest's path set against the filesystem's, in both
+directions, for `input/` and `output/`:
+
+- a managed file absent from its manifest — refused;
+- a manifest entry whose file no longer exists — refused;
+- a relative path recorded more than once — refused;
+- an absent manifest while managed files exist — refused.
+
+An empty managed directory is not a finding: a freshly initialised workspace has
+nothing to account for, and an absent manifest is only an error once content
+actually exists.
+
+### Refusal reporting never writes outside the workspace
+
+If any core directory fails resolved-path boundary validation — for example a
+`checks/` Windows junction or reparse point that resolves outside the managed
+workspace — `validate` returns `REFUSE` and does **not** write
+`checks/validation_report.json` through that path. There is deliberately no
+fallback: the report is not redirected to a parent directory, the repository root,
+the user profile, or system temp. The refusal is returned in memory and through
+the CLI, which is sufficient for the MVP; `ValidationResult.report_written` reports
+whether a report was persisted.
 
 ### Explicit limitation: this is not an OS sandbox
 
@@ -288,17 +317,23 @@ evidence-workspace discipline only.
 ### Tests and demo
 
 ```
-python tests/run_all.py     # unittest discovery
-pytest tests                # the same suite
-python tests/smoke_e2e.py   # synthetic end-to-end demonstration
+python tests/run_all.py              # the repository runner (recommended)
+pytest tests                         # the same suite
+python -m unittest discover -s tests # explicit start directory
+python tests/smoke_e2e.py            # synthetic end-to-end demonstration
 ```
+
+Note that bare `python -m unittest discover` from the repository root collects no
+tests, because the suite lives under `tests/` and is not an importable top-level
+package from there. Use one of the explicit commands above.
 
 The suite covers workspace creation, invalid-spec refusal, path-traversal refusal,
 file and recursive-directory staging, SHA-256 correctness, semantic filename
 generation, artifact placement, collision refusal, identical-placement
-idempotence, missing-artifact `INCOMPLETE`, complete-workspace `PASS`, hash
-mismatch `REFUSE`, unexpected-output `REFUSE`, and non-mutation of original
-inputs.
+idempotence, undeclared-placement refusal, manifest coverage failures (unlisted
+file, entry without a file, duplicate entry), escaped-`checks/` refusal without an
+external write, missing-artifact `INCOMPLETE`, complete-workspace `PASS`, hash
+mismatch `REFUSE`, unexpected-output `REFUSE`, and non-mutation of original inputs.
 
 `fixtures/m03_r2_demo/` holds one small synthetic demo. It contains no real
 calibration evidence, no private path and no private experimental artifact.

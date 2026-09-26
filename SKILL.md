@@ -231,8 +231,8 @@ makes those questions mechanical.
 | --- | --- |
 | `init` | Validate a TaskSpec and create the controlled workspace: `input/`, `output/`, `manifests/`, `checks/`. Refuses to overwrite incompatible content. |
 | `stage` | Copy declared inputs (`mode: "copy"`, files or directories recursively) into `input/` and record every file's size and SHA-256 in `manifests/input_manifest.json`. |
-| `place` | Copy an already-produced artifact into `output/` under its canonical filename and update `manifests/output_manifest.json`. Refuses a collision unless the bytes are identical. |
-| `validate` | Check TaskSpec integrity, layout, required artifacts, naming compliance, expected location, manifest hashes, unexpected output files, and path boundaries. Writes `checks/validation_report.json`. |
+| `place` | Copy an already-produced artifact into `output/` under its canonical filename and update `manifests/output_manifest.json`. **Declared artifacts only**: the request must match a TaskSpec `expected_artifacts` entry on `artifact_role`, `topic` and `extension`. An undeclared artifact is refused before anything is written. Refuses a collision unless the bytes are identical. |
+| `validate` | Check TaskSpec integrity, layout, required artifacts, naming compliance, expected location, manifest hashes, **manifest coverage of managed input/output files**, unexpected output files, and path boundaries. Writes `checks/validation_report.json`, except when `checks/` resolves outside the workspace. |
 
 CLI:
 
@@ -270,13 +270,30 @@ from an explicit command argument only — never from file content.
 
 ### PASS / INCOMPLETE / REFUSE
 
-- **PASS** — every required artifact is present under its canonical name and every
-  recorded digest still matches.
+- **PASS** — every required artifact is present under its canonical name, every
+  recorded digest still matches, and the manifests completely account for the
+  managed files: every file under `input/` and `output/` has exactly one manifest
+  entry, every manifest entry has exactly one existing managed file, and no
+  relative path is recorded twice.
 - **INCOMPLETE** — the workspace is sound but required artifacts are absent. Not
   finished is not the same as not trustworthy.
 - **REFUSE** — invalid spec, unsafe path, naming violation, manifest corruption,
-  hash mismatch, collision, or an unexpected file in `output/`. `REFUSE` outranks
-  `INCOMPLETE`.
+  hash mismatch, manifest coverage failure, undeclared placement, collision, or an
+  unexpected file in `output/`, including any path-boundary violation. `REFUSE`
+  outranks `INCOMPLETE`.
+
+Two invariants are worth naming explicitly because they are easy to get subtly
+wrong:
+
+- **Declared artifacts only.** `place` refuses an artifact the TaskSpec does not
+  declare, before any byte is copied. Without this gate the operation would report
+  success for a file that `validate` then rejects as undeclared, which is
+  internally inconsistent.
+- **No write through an escaped directory.** If `checks/` resolves outside the
+  managed workspace, `validate` returns `REFUSE` and does not persist
+  `checks/validation_report.json` through it. There is no fallback to any location
+  outside the workspace; the refusal is returned in memory and through the CLI, and
+  `ValidationResult.report_written` records whether a report was persisted.
 
 ### Explicit limitation: this is not an OS sandbox
 
@@ -287,6 +304,10 @@ workspace, constrains the paths its own operations will construct and write,
 stages known inputs, records manifests, and validates the resulting workspace. No
 filesystem isolation is implemented and none is claimed.
 
+Refusing to write through an escaped `checks/` directory is managed-workspace
+safety, not isolation: it stops *this harness* from writing outside the room it
+was given. It does not stop any other program from doing so.
+
 The four core directories are the whole hierarchy. The harness is not a general
 file manager, does not rename unrelated files, does not retrieve evidence, does
 not mutate canonical evidence, and makes no claim about evidence sufficiency.
@@ -294,10 +315,15 @@ not mutate canonical evidence, and makes no claim about evidence sufficiency.
 ### Tests and demo
 
 ```
-python tests/run_all.py     # unittest discovery
-pytest tests                # the same suite
-python tests/smoke_e2e.py   # synthetic end-to-end demonstration
+python tests/run_all.py              # the repository runner (recommended)
+pytest tests                         # the same suite
+python -m unittest discover -s tests # explicit start directory
+python tests/smoke_e2e.py            # synthetic end-to-end demonstration
 ```
+
+Bare `python -m unittest discover` from the repository root collects no tests,
+because the suite lives under `tests/` and is not an importable top-level package
+from there. Use one of the explicit commands above.
 
 `fixtures/m03_r2_demo/` is entirely synthetic: no real calibration evidence and
 no private path is present.

@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import io
+import json
+import os
+import shutil
+import subprocess
 import sys
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -15,6 +21,7 @@ from skills.chenhai_harness import (  # noqa: E402
     stage_workspace,
     validate_workspace,
 )
+from skills.chenhai_harness.__main__ import main  # noqa: E402
 from skills.chenhai_harness.outcomes import INCOMPLETE, PASS, REFUSE, RefusalError  # noqa: E402
 from skills.chenhai_harness.workspace import (  # noqa: E402
     OUTPUT_MANIFEST_RELATIVE,
@@ -452,6 +459,329 @@ class ValidateTests(HarnessTestCase):
         result = validate_workspace(self.workspace_root)
         self.assertEqual(result.status, REFUSE)
         self.assertEqual(self.report()["status"], REFUSE)
+
+
+class ManifestCoverageTests(HarnessTestCase):
+    """CH-001: the manifest must account for every managed input/output file.
+
+    Hash checking alone proves existing entries are accurate. These tests cover
+    the other direction: that the manifest's path set equals the filesystem's,
+    so an unlisted file cannot hide inside a managed directory while validation
+    still reports ``PASS``.
+    """
+
+    def output_manifest_path(self) -> Path:
+        return self.workspace_root / OUTPUT_MANIFEST_RELATIVE
+
+    def test_validate_refuses_required_output_omitted_from_manifest(self) -> None:
+        stage_workspace(self.workspace_root)
+        self.place_both()
+        self.assertEqual(validate_workspace(self.workspace_root).status, PASS)
+
+        # The managed output file still exists and still hashes correctly; only
+        # its manifest entry is gone.
+        document = _support.read_json_file(self.output_manifest_path())
+        document["artifacts"] = []
+        document["artifact_count"] = 0
+        self.output_manifest_path().write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, REFUSE)
+        self.assertTrue(
+            any(
+                "not recorded in the output manifest" in item
+                for item in result.report["hash_mismatches"]
+            ),
+            result.report["hash_mismatches"],
+        )
+
+    def test_validate_refuses_unlisted_staged_input(self) -> None:
+        stage_workspace(self.workspace_root)
+        self.assertEqual(
+            validate_workspace(self.workspace_root).status, INCOMPLETE
+        )
+
+        smuggled = self.workspace_root / "input" / "dossier" / "unlisted.txt"
+        smuggled.write_bytes(b"never staged through the manifest\n")
+
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, REFUSE)
+        self.assertTrue(
+            any(
+                "not recorded in the input manifest" in item
+                for item in result.report["hash_mismatches"]
+            ),
+            result.report["hash_mismatches"],
+        )
+
+    def test_validate_refuses_duplicate_manifest_entries(self) -> None:
+        stage_workspace(self.workspace_root)
+        self.place_both()
+
+        path = self.output_manifest_path()
+        document = _support.read_json_file(path)
+        duplicated = list(document["artifacts"])
+        duplicated.append(dict(document["artifacts"][0]))
+        document["artifacts"] = duplicated
+        document["artifact_count"] = len(duplicated)
+        path.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, REFUSE)
+        self.assertTrue(
+            any(
+                "recorded 2 times in the output manifest" in item
+                for item in result.report["hash_mismatches"]
+            ),
+            result.report["hash_mismatches"],
+        )
+
+    def test_validate_refuses_input_manifest_entry_without_a_file(self) -> None:
+        stage_workspace(self.workspace_root)
+        # Remove a staged file while leaving its manifest entry in place, so the
+        # manifest points at something that no longer exists.
+        (self.workspace_root / "input" / "dossier" / "README.txt").unlink()
+
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, REFUSE)
+        self.assertTrue(
+            any(
+                "recorded in the input manifest but missing on disk" in item
+                for item in result.report["hash_mismatches"]
+            ),
+            result.report["hash_mismatches"],
+        )
+
+    def test_empty_workspace_without_manifests_is_not_a_coverage_failure(self) -> None:
+        """A freshly initialised workspace has nothing to account for."""
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, INCOMPLETE)
+        self.assertEqual(result.report["hash_mismatches"], [])
+
+    def test_covered_manifests_pass(self) -> None:
+        """The positive direction, so the check cannot pass by always refusing."""
+        stage_workspace(self.workspace_root)
+        self.place_both()
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, PASS)
+        self.assertEqual(result.report["hash_mismatches"], [])
+        self.assertEqual(result.report["integrity_errors"], [])
+
+
+class DeclarationGateTests(HarnessTestCase):
+    """CH-002: place accepts declared artifacts only, and writes nothing on refuse."""
+
+    def test_place_refuses_undeclared_artifact_without_writing(self) -> None:
+        manifest_path = self.workspace_root / OUTPUT_MANIFEST_RELATIVE
+        manifest_before = manifest_path.read_bytes() if manifest_path.is_file() else None
+
+        source = self.artifact_file("rogue.md", b"# undeclared artifact\n")
+        source_before = source.read_bytes()
+
+        with self.assertRaises(RefusalError) as caught:
+            place_artifact(
+                self.workspace_root,
+                source,
+                artifact_role="rogue_role",
+                topic="rogue_topic",
+            )
+        self.assertIn("does not declare", str(caught.exception))
+
+        # No output file, no manifest mutation, no partial write, no stray temp.
+        output_entries = sorted(p.name for p in (self.workspace_root / "output").iterdir())
+        self.assertEqual(output_entries, [])
+        self.assertFalse(manifest_path.exists())
+        if manifest_before is not None:
+            self.assertEqual(manifest_path.read_bytes(), manifest_before)
+        # The source is untouched and never consumed.
+        self.assertEqual(source.read_bytes(), source_before)
+
+    def test_place_refuses_undeclared_topic_even_when_role_matches(self) -> None:
+        with self.assertRaises(RefusalError) as caught:
+            place_artifact(
+                self.workspace_root,
+                self.artifact_file("answer.md", ANSWER_BYTES),
+                artifact_role="final_answer",
+                topic="undeclared_topic",
+            )
+        self.assertIn("does not declare", str(caught.exception))
+        self.assertEqual(sorted(p.name for p in (self.workspace_root / "output").iterdir()), [])
+
+    def test_place_refuses_undeclared_extension_even_when_role_and_topic_match(self) -> None:
+        with self.assertRaises(RefusalError) as caught:
+            place_artifact(
+                self.workspace_root,
+                self.artifact_file("answer.txt", ANSWER_BYTES),
+                artifact_role="final_answer",
+                topic="legal_analysis",
+                extension=".txt",
+            )
+        self.assertIn("does not declare", str(caught.exception))
+        self.assertEqual(sorted(p.name for p in (self.workspace_root / "output").iterdir()), [])
+
+    def test_declaration_match_uses_the_same_normalization_as_the_filename(self) -> None:
+        """A differently-spelled but equivalent declaration must still match."""
+        result = place_artifact(
+            self.workspace_root,
+            self.artifact_file("answer.md", ANSWER_BYTES),
+            artifact_role="  Final_Answer  ",
+            topic="Legal Analysis",
+        )
+        self.assertEqual(result.filename, ANSWER_FILENAME)
+        self.assertFalse(result.idempotent)
+
+    def test_refusal_does_not_mutate_an_existing_manifest(self) -> None:
+        stage_workspace(self.workspace_root)
+        place_artifact(
+            self.workspace_root,
+            self.artifact_file("answer.md", ANSWER_BYTES),
+            artifact_role="final_answer",
+            topic="legal_analysis",
+        )
+        manifest_path = self.workspace_root / OUTPUT_MANIFEST_RELATIVE
+        before = manifest_path.read_bytes()
+
+        with self.assertRaises(RefusalError):
+            place_artifact(
+                self.workspace_root,
+                self.artifact_file("rogue.md", b"# undeclared\n"),
+                artifact_role="rogue_role",
+                topic="rogue_topic",
+            )
+        self.assertEqual(manifest_path.read_bytes(), before)
+
+
+class EscapedChecksDirectoryTests(HarnessTestCase):
+    """CH-003: validation must never write through an escaped checks directory."""
+
+    def _make_junction(self, link: Path, target: Path) -> bool:
+        """Create a Windows directory junction. Returns False when unavailable.
+
+        A junction exercises the real thing this blocker is about: a path that
+        *resolves* outside the workspace while still sitting at the expected
+        lexical location. A ``..`` traversal cannot express that and is
+        deliberately not used as a substitute.
+        """
+        if os.name != "nt":
+            return False
+        target.mkdir(parents=True, exist_ok=True)
+        if link.exists():
+            if link.is_symlink() or os.path.islink(str(link)):
+                link.unlink()
+            else:
+                shutil.rmtree(link, ignore_errors=True)
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return completed.returncode == 0 and link.exists()
+
+    def test_validate_refuses_escaped_checks_junction_without_external_write(self) -> None:
+        external = self.root / "external_target"
+        link = self.workspace_root / "checks"
+        if not self._make_junction(link, external):
+            self.skipTest("directory junctions are not available on this platform")
+
+        # Make the workspace unsafe so REFUSE is the expected status, which is
+        # exactly the path that previously wrote the report through the junction.
+        (self.workspace_root / "output" / "stray.txt").write_text("x", encoding="utf-8")
+
+        result = validate_workspace(self.workspace_root)
+
+        self.assertEqual(result.status, REFUSE)
+        self.assertTrue(
+            any(
+                "checks/" in item and "path boundary" in item
+                for item in result.report["integrity_errors"]
+            ),
+            result.report["integrity_errors"],
+        )
+        # The refusal was returned to the caller even though it was not persisted.
+        self.assertFalse(result.report_written)
+        # Nothing at all was written across the boundary.
+        self.assertEqual(
+            sorted(p.name for p in external.iterdir()),
+            [],
+            "validation wrote through the escaped checks directory",
+        )
+        self.assertFalse((external / "validation_report.json").exists())
+        self.assertFalse((external / "validation_report.json.tmp").exists())
+
+    def test_validate_does_not_fall_back_to_any_outside_directory(self) -> None:
+        """No parent, repository root, profile or temp fallback may be used."""
+        external = self.root / "external_target_2"
+        link = self.workspace_root / "checks"
+        if not self._make_junction(link, external):
+            self.skipTest("directory junctions are not available on this platform")
+
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, REFUSE)
+        self.assertFalse(result.report_written)
+        self.assertEqual(sorted(p.name for p in external.iterdir()), [])
+        # The report path still names the in-workspace location; it simply was
+        # not persisted, which is the documented MVP behaviour.
+        self.assertEqual(
+            Path(result.report_path),
+            self.workspace_root / VALIDATION_REPORT_RELATIVE,
+        )
+        self.assertFalse(Path(result.report_path).exists())
+
+    def test_safe_checks_directory_still_persists_the_report(self) -> None:
+        """The guard must not disable report writing in the normal case."""
+        stage_workspace(self.workspace_root)
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, INCOMPLETE)
+        self.assertTrue(result.report_written)
+        self.assertTrue((self.workspace_root / VALIDATION_REPORT_RELATIVE).is_file())
+
+
+class CliExitCodeTests(HarnessTestCase):
+    """CLI exit codes for the three patched refusal paths."""
+
+    def _run(self, arguments: list[str]) -> int:
+        return main(arguments)
+
+    def test_undeclared_place_exit_code_is_three(self) -> None:
+        source = self.artifact_file("rogue.md", b"# undeclared\n")
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            code = self._run(
+                [
+                    "place",
+                    str(self.workspace_root),
+                    str(source),
+                    "--role",
+                    "rogue_role",
+                    "--topic",
+                    "rogue_topic",
+                ]
+            )
+        self.assertEqual(code, 3)
+        self.assertIn("REFUSE", buffer.getvalue())
+        self.assertEqual(sorted(p.name for p in (self.workspace_root / "output").iterdir()), [])
+
+    def test_manifest_coverage_failure_exit_code_is_three(self) -> None:
+        stage_workspace(self.workspace_root)
+        self.place_both()
+        manifest_path = self.workspace_root / OUTPUT_MANIFEST_RELATIVE
+        document = _support.read_json_file(manifest_path)
+        document["artifacts"] = []
+        document["artifact_count"] = 0
+        manifest_path.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = self._run(["validate", str(self.workspace_root)])
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(buffer.getvalue())["status"], "REFUSE")
 
 
 if __name__ == "__main__":

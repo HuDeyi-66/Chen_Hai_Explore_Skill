@@ -193,8 +193,8 @@ PASS / INCOMPLETE / REFUSE
 | --- | --- |
 | `init` | 校验 TaskSpec 并创建工作区，把 spec 持久化到 `manifests/task_spec.json`。若目标位置已有不兼容内容则拒绝，而不是删除或重置。 |
 | `stage` | 按声明暂存输入（`mode: "copy"`，支持单文件与目录递归）到 `input/`，并在 `manifests/input_manifest.json` 中逐文件记录 `relative_path`、`size_bytes`、`sha256_lower` 与 `source_path`。原始输入永不被修改。 |
-| `place` | 把已经产出的产物按规范文件名复制到 `output/`，并更新 `manifests/output_manifest.json`。默认复制而非移动，绝不检查产物内容；命名冲突时除非字节完全一致否则拒绝；字节一致时该操作是幂等的。 |
-| `validate` | 校验 TaskSpec 完整性、工作区布局、必需产物、规范文件名、期望位置、清单与文件哈希一致性、受控输出目录中的意外文件，以及路径边界。写入 `checks/validation_report.json`。 |
+| `place` | 把已经产出的产物按规范文件名复制到 `output/`，并更新 `manifests/output_manifest.json`。**只接受 TaskSpec 中声明的产物**：请求必须与某条 `expected_artifacts` 在 `artifact_role`、`topic`、`extension` 上匹配，且使用与规范文件名相同的规范化规则。未声明的产物在**复制任何字节之前**即被拒绝，因此不会产生输出文件、不会改动清单、也不会留下任何部分写入。默认复制而非移动，绝不检查产物内容；命名冲突时除非字节完全一致否则拒绝；字节一致时该操作是幂等的。 |
+| `validate` | 校验 TaskSpec 完整性、工作区布局、必需产物、规范文件名、期望位置、清单与文件哈希一致性、清单对受管理输入/输出文件的覆盖、受控输出目录中的意外文件，以及路径边界。写入 `checks/validation_report.json`——但**绝不**经由解析后位于受管理工作区之外的 `checks/` 目录写入。 |
 
 ```
 python -m skills.chenhai_harness init <task_spec.json>
@@ -229,10 +229,34 @@ python -m skills.chenhai_harness validate <workspace>
 
 ### PASS / INCOMPLETE / REFUSE
 
-- **PASS** —— 全部必需产物存在、命名合规、哈希一致。
+- **PASS** —— 全部必需产物存在、命名合规、哈希一致，**且清单完整覆盖**：`input/` 与
+  `output/` 下的每一个受管理文件都恰好对应一条清单记录，每一条清单记录都对应一个
+  确实存在的受管理文件，且同一相对路径不会被记录两次。清单未覆盖的受管理文件属于
+  拒绝项，而不是警告。
 - **INCOMPLETE** —— 工作区本身有效，但缺少一个或多个必需的期望产物。
-- **REFUSE** —— spec 非法、路径不安全、命名违规、清单损坏、哈希不匹配、命名冲突，
-  或其他完整性违规（包括受控输出目录中出现意外文件）。`REFUSE` 优先于 `INCOMPLETE`。
+- **REFUSE** —— spec 非法、路径不安全、命名违规、清单损坏、哈希不匹配、清单覆盖缺失、
+  放置未声明产物、命名冲突，或其他完整性违规（包括受控输出目录中出现意外文件，
+  以及任何路径边界违规）。`REFUSE` 优先于 `INCOMPLETE`。
+
+### 清单覆盖（manifest coverage）
+
+`validate` 会对 `input/` 与 `output/` 做双向的「清单路径集合 ↔ 文件系统实际集合」比对：
+
+- 受管理文件未出现在其清单中 —— 拒绝；
+- 清单记录指向的文件已不存在 —— 拒绝；
+- 同一相对路径被记录多次 —— 拒绝；
+- 存在受管理文件但清单缺失 —— 拒绝。
+
+受管理目录为空不算问题：刚初始化的工作区本就没有内容需要记录，只有在内容确实存在后，
+缺失清单才构成错误。
+
+### 拒答报告绝不写到工作区之外
+
+若任一核心目录未通过「解析后路径」边界校验——例如 `checks/` 是指向工作区之外的
+Windows junction / 重解析点——`validate` 会返回 `REFUSE`，并且**不会**经由该路径写入
+`checks/validation_report.json`。此处刻意不设任何回退：不会改写父目录、仓库根目录、
+用户目录或系统临时目录。拒答结果仍通过内存返回值与 CLI 输出交付，这对 MVP 已足够；
+是否实际持久化了报告由 `ValidationResult.report_written` 表示。
 
 ### 明确限制：这不是操作系统沙箱
 
@@ -249,10 +273,14 @@ python -m skills.chenhai_harness validate <workspace>
 ### 测试与演示
 
 ```
-python tests/run_all.py     # unittest 发现
-pytest tests                # 同一套测试
-python tests/smoke_e2e.py   # 合成端到端演示
+python tests/run_all.py              # 本仓库的运行器（推荐）
+pytest tests                         # 同一套测试
+python -m unittest discover -s tests # 显式指定起始目录
+python tests/smoke_e2e.py            # 合成端到端演示
 ```
+
+注意：在仓库根目录直接执行裸命令 `python -m unittest discover` 会收集到 0 个测试，
+因为测试套件位于 `tests/` 下，从该处并不是可导入的顶层包。请使用上面的显式命令。
 
 `fixtures/m03_r2_demo/` 只包含一个小型合成演示，不含任何真实标定证据、
 私有路径或私有实验产物。
