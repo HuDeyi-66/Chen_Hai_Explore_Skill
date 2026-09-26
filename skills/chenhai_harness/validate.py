@@ -308,10 +308,57 @@ def _check_manifest_coverage(
         )
 
 
+def _check_manifest_count(
+    *,
+    document: dict[str, Any],
+    count_key: str,
+    label: str,
+    entry_total: int,
+    managed_total: int,
+    findings: ValidationFindings,
+) -> None:
+    """Check F (continued): the recorded count agrees with the recorded entries.
+
+    Each manifest carries a scalar count (``entry_count`` / ``artifact_count``)
+    alongside its array. That scalar is metadata a consumer may read without
+    walking the array, so it is worth exactly as much as its agreement with the
+    array — and, through the coverage comparison, with the managed filesystem.
+    A count of ``0`` next to a populated array is therefore a refusal, not a
+    cosmetic discrepancy.
+    """
+    if count_key not in document:
+        findings.integrity_errors.append(
+            f"{label} manifest records no {count_key}"
+        )
+        return
+    value = document[count_key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        findings.integrity_errors.append(
+            f"{label} manifest {count_key} is not an integer: {value!r}"
+        )
+        return
+    if value < 0:
+        findings.integrity_errors.append(
+            f"{label} manifest {count_key} is negative: {value}"
+        )
+        return
+    if value != entry_total:
+        findings.integrity_errors.append(
+            f"{label} manifest records {count_key}={value} but contains "
+            f"{entry_total} entry record(s)"
+        )
+    if value != managed_total:
+        findings.integrity_errors.append(
+            f"{label} manifest records {count_key}={value} but {managed_total} "
+            f"managed file(s) exist under {label}/"
+        )
+
+
 def _check_manifest(
     *,
     manifest_path: Path,
     collection_key: str,
+    count_key: str,
     label: str,
     findings: ValidationFindings,
     base_dir: Path,
@@ -402,6 +449,14 @@ def _check_manifest(
                 f"{relative} (size {target.stat().st_size} != recorded {recorded_size})"
             )
 
+    _check_manifest_count(
+        document=document,
+        count_key=count_key,
+        label=label,
+        entry_total=len(entries),
+        managed_total=len(managed_files),
+        findings=findings,
+    )
     _check_manifest_coverage(
         label=label,
         managed_files=managed_files,
@@ -488,6 +543,7 @@ def validate_workspace(
         _check_manifest(
             manifest_path=workspace.input_manifest_path,
             collection_key="entries",
+            count_key="entry_count",
             label="input",
             findings=findings,
             # Manifest paths are workspace-relative for both manifests, so the
@@ -499,6 +555,7 @@ def validate_workspace(
         _check_manifest(
             manifest_path=workspace.output_manifest_path,
             collection_key="artifacts",
+            count_key="artifact_count",
             label="output",
             findings=findings,
             base_dir=workspace.root,

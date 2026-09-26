@@ -24,6 +24,7 @@ from skills.chenhai_harness import (  # noqa: E402
 from skills.chenhai_harness.__main__ import main  # noqa: E402
 from skills.chenhai_harness.outcomes import INCOMPLETE, PASS, REFUSE, RefusalError  # noqa: E402
 from skills.chenhai_harness.workspace import (  # noqa: E402
+    INPUT_MANIFEST_RELATIVE,
     OUTPUT_MANIFEST_RELATIVE,
     VALIDATION_REPORT_RELATIVE,
 )
@@ -555,6 +556,129 @@ class ManifestCoverageTests(HarnessTestCase):
             ),
             result.report["hash_mismatches"],
         )
+
+    def test_validate_refuses_input_manifest_entry_count_zero(self) -> None:
+        """The count scalar must agree with the entries it summarises."""
+        stage_workspace(self.workspace_root)
+        self.place_both()
+        self.assertEqual(validate_workspace(self.workspace_root).status, PASS)
+
+        path = self.workspace_root / INPUT_MANIFEST_RELATIVE
+        document = _support.read_json_file(path)
+        # Files and entries are left intact; only the count scalar is wrong.
+        self.assertEqual(document["entry_count"], 1)
+        self.assertEqual(len(document["entries"]), 1)
+        document["entry_count"] = 0
+        path.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, REFUSE)
+        self.assertTrue(
+            any(
+                "entry_count=0" in item and "managed file" in item
+                for item in result.report["integrity_errors"]
+            ),
+            result.report["integrity_errors"],
+        )
+
+    def test_validate_refuses_output_manifest_artifact_count_zero(self) -> None:
+        stage_workspace(self.workspace_root)
+        self.place_both()
+        self.assertEqual(validate_workspace(self.workspace_root).status, PASS)
+
+        path = self.workspace_root / OUTPUT_MANIFEST_RELATIVE
+        document = _support.read_json_file(path)
+        self.assertEqual(document["artifact_count"], 2)
+        self.assertEqual(len(document["artifacts"]), 2)
+        document["artifact_count"] = 0
+        path.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, REFUSE)
+        self.assertTrue(
+            any(
+                "artifact_count=0" in item and "managed file" in item
+                for item in result.report["integrity_errors"]
+            ),
+            result.report["integrity_errors"],
+        )
+
+    def test_validate_refuses_a_count_that_disagrees_with_the_array_only(self) -> None:
+        """A count matching the filesystem but not the array is still refused."""
+        stage_workspace(self.workspace_root)
+        self.place_both()
+
+        path = self.workspace_root / OUTPUT_MANIFEST_RELATIVE
+        document = _support.read_json_file(path)
+        document["artifacts"] = document["artifacts"][:1]
+        document["artifact_count"] = 2  # matches disk, not the array
+        path.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, REFUSE)
+        self.assertTrue(
+            any(
+                "artifact_count=2" in item and "entry record" in item
+                for item in result.report["integrity_errors"]
+            ),
+            result.report["integrity_errors"],
+        )
+
+    def test_validate_refuses_non_integer_count(self) -> None:
+        stage_workspace(self.workspace_root)
+        path = self.workspace_root / INPUT_MANIFEST_RELATIVE
+        document = _support.read_json_file(path)
+        document["entry_count"] = "1"
+        path.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, REFUSE)
+        self.assertTrue(
+            any(
+                "entry_count is not an integer" in item
+                for item in result.report["integrity_errors"]
+            ),
+            result.report["integrity_errors"],
+        )
+
+    def test_validate_refuses_missing_count_field(self) -> None:
+        stage_workspace(self.workspace_root)
+        path = self.workspace_root / INPUT_MANIFEST_RELATIVE
+        document = _support.read_json_file(path)
+        del document["entry_count"]
+        path.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        result = validate_workspace(self.workspace_root)
+        self.assertEqual(result.status, REFUSE)
+        self.assertTrue(
+            any(
+                "records no entry_count" in item
+                for item in result.report["integrity_errors"]
+            ),
+            result.report["integrity_errors"],
+        )
+
+    def test_count_field_mismatch_exit_code_is_three(self) -> None:
+        stage_workspace(self.workspace_root)
+        path = self.workspace_root / INPUT_MANIFEST_RELATIVE
+        document = _support.read_json_file(path)
+        document["entry_count"] = 0
+        path.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = main(["validate", str(self.workspace_root)])
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(buffer.getvalue())["status"], REFUSE)
 
     def test_empty_workspace_without_manifests_is_not_a_coverage_failure(self) -> None:
         """A freshly initialised workspace has nothing to account for."""
